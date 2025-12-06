@@ -1,0 +1,143 @@
+---
+# Single-GPU toy training sample for GB200
+# Trains a simple MLP on synthetic data to demonstrate GB200 capabilities and W&B logging
+# - Uses 1x GB200 GPU with bfloat16 mixed precision (optimized for tensor cores)
+# - Synthetic dataset: 8192 samples, 4096-dim input/output
+# - Model: SimpleMLP (4096→8192→4096)
+# - Logs metrics to Weights & Biases (batch loss, epoch loss, throughput)
+# - Expected throughput: ~7,700 samples/sec
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: train-gb200-simple
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node.kubernetes.io/instance-type: p6e-gb200.36xlarge
+      containers:
+      - name: trainer
+        image: nvcr.io/nvidia/pytorch:25.11-py3
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+        env:
+        - name: NUM_EPOCHS
+          value: "5"
+        - name: WANDB_API_KEY
+          value: "${WANDB_API_KEY}"
+        - name: WANDB_PROJECT
+          value: "gb200-training"
+        command:
+          - bash
+          - -c
+          - |
+            set -euxo pipefail
+            
+            pip install -q wandb
+            
+            python << 'PYEOF'
+            import os
+            import time
+            import torch
+            from torch import nn
+            from torch.utils.data import Dataset, DataLoader
+            import wandb
+
+            class ToyDataset(Dataset):
+                def __init__(self, num_samples=8192, in_dim=4096, out_dim=4096):
+                    self.num_samples = num_samples
+                    self.inputs = torch.randn(num_samples, in_dim, dtype=torch.float32)
+                    self.targets = torch.randn(num_samples, out_dim, dtype=torch.float32)
+                
+                def __len__(self):
+                    return self.num_samples
+                
+                def __getitem__(self, idx):
+                    return self.inputs[idx], self.targets[idx]
+
+            class SimpleMLP(nn.Module):
+                def __init__(self, input_dim=4096, hidden_dim=8192, output_dim=4096):
+                    super().__init__()
+                    self.net = nn.Sequential(
+                        nn.Linear(input_dim, hidden_dim, bias=False),
+                        nn.GELU(),
+                        nn.Linear(hidden_dim, output_dim, bias=False),
+                    )
+                
+                def forward(self, x):
+                    return self.net(x)
+
+            print("=== GB200 Single-GPU Training ===")
+            wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "gb200-training"),
+                name="gb200-1gpu-simple",
+                config={
+                    "batch_size": 32,
+                    "learning_rate": 1e-3,
+                    "epochs": int(os.environ.get("NUM_EPOCHS", "5")),
+                    "architecture": "SimpleMLP",
+                    "gpu_type": "GB200"
+                }
+            )
+            
+            device = torch.device("cuda:0")
+            dataset = ToyDataset(num_samples=8192, in_dim=4096, out_dim=4096)
+            dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
+            
+            model = SimpleMLP().to(device)
+            torch.set_float32_matmul_precision("high")
+            
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+            scaler = torch.cuda.amp.GradScaler(enabled=True)
+            
+            num_epochs = int(os.environ.get("NUM_EPOCHS", "5"))
+            
+            for epoch in range(1, num_epochs + 1):
+                model.train()
+                start = time.time()
+                total_loss = 0.0
+                total_samples = 0
+                
+                for batch_idx, (x_cpu, y_cpu) in enumerate(dataloader):
+                    x = x_cpu.to(device, non_blocking=True)
+                    y = y_cpu.to(device, non_blocking=True)
+                    
+                    optimizer.zero_grad(set_to_none=True)
+                    
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                        preds = model(x)
+                        loss = torch.nn.functional.mse_loss(preds, y)
+                    
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    
+                    total_samples += x.size(0)
+                    total_loss += loss.item() * x.size(0)
+                    
+                    # Log every 50 batches
+                    if (batch_idx + 1) % 50 == 0:
+                        wandb.log({
+                            "batch_loss": loss.item(),
+                            "batch": epoch * len(dataloader) + batch_idx
+                        })
+                
+                avg_loss = total_loss / total_samples
+                elapsed = time.time() - start
+                throughput = total_samples / max(elapsed, 1e-6)
+                
+                print(f"[Epoch {epoch}/{num_epochs}] loss={avg_loss:.4f}, throughput={throughput:,.0f} samples/s, time={elapsed:.2f}s")
+                wandb.log({
+                    "epoch": epoch,
+                    "epoch_loss": avg_loss,
+                    "throughput_samples_per_sec": throughput,
+                    "epoch_time_sec": elapsed
+                })
+            
+            wandb.finish()
+            print("=== Training Complete ===")
+            PYEOF
