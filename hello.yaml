@@ -1,0 +1,51 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hello-gb200
+spec:
+  backoffLimit: 0  # don't retry on failure; easier to debug
+  template:
+    spec:
+      restartPolicy: Never
+      # Optional: force scheduling onto P6e GB200 nodes only
+      # (comment out if your cluster uses different labels)
+      nodeSelector:
+        node.kubernetes.io/instance-type: p6e-gb200.36xlarge
+      containers:
+        - name: hello-gb200
+          # NGC PyTorch container – optimized for NVIDIA GPUs incl. Blackwell
+          image: nvcr.io/nvidia/pytorch:25.11-py3
+          # If your cluster uses a private registry secret, reference it at pod.spec.imagePullSecrets
+          resources:
+            # On K8s extended resources, only 'limits' really matters;
+            # here we ask for 1 whole GPU from the node.
+            limits:
+              nvidia.com/gpu: 1
+          env:
+            # Keep NCCL output quiet for this hello-world
+            - name: NCCL_DEBUG
+              value: WARN
+          command: ["bash", "-lc"]
+          args:
+            - |
+              echo "=== nvidia-smi ==="
+              nvidia-smi
+
+              echo
+              echo "=== PyTorch CUDA sanity check ==="
+              python - << 'PY'
+              import torch
+
+              print("CUDA available:", torch.cuda.is_available())
+              print("GPU count:", torch.cuda.device_count())
+
+              assert torch.cuda.is_available(), "CUDA is not available inside this container."
+              assert torch.cuda.device_count() > 0, "No GPUs visible to PyTorch."
+
+              for idx in range(torch.cuda.device_count()):
+                  props = torch.cuda.get_device_properties(idx)
+                  # On Blackwell B200 you should see sm_120 and large memory per GPU.
+                  print(f"[{idx}] name={props.name}, "
+                        f"sm={props.major}{props.minor}, "
+                        f"total_memory={props.total_memory/1024**3:.1f} GiB")
+              PY

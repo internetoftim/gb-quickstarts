@@ -1,0 +1,160 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: finetune-gpt-oss
+  labels:
+    app: finetune-gpt-oss
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: finetune-gpt-oss
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node.kubernetes.io/instance-type: p6e-gb200.36xlarge
+      containers:
+      - name: finetune
+        image: nvcr.io/nvidia/pytorch:25.11-py3
+        command:
+          - bash
+          - -c
+          - |
+            set -euxo pipefail
+            
+            # Install dependencies
+            pip install transformers datasets accelerate wandb bitsandbytes peft
+            
+            # Create fine-tuning script
+            cat > /workspace/finetune.py << 'PYEOF'
+            import os
+            import torch
+            from datasets import load_dataset
+            from transformers import (
+                AutoModelForCausalLM,
+                AutoTokenizer,
+                TrainingArguments,
+                Trainer,
+                DataCollatorForLanguageModeling,
+                Mxfp4Config
+            )
+            from peft import LoraConfig, get_peft_model
+            import wandb
+            
+            # Initialize W&B
+            wandb.init(project="gpt-oss-finetune", name="gpt-oss-20b-lora")
+            
+            # Load model and tokenizer
+            model_name = "openai/gpt-oss-20b"
+            tokenizer = AutoTokenizer.from_pretrained(model_name, token=os.environ["HF_TOKEN"])
+            
+            # Load model with MXFP4 quantization (matches model's native format)
+            quant_config = Mxfp4Config(dequantize=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                quantization_config=quant_config,
+                device_map="auto",
+                token=os.environ["HF_TOKEN"]
+            )
+            
+            # LoRA configuration
+            lora_config = LoraConfig(
+                r=16,
+                lora_alpha=32,
+                target_modules=["q_proj", "v_proj"],
+                lora_dropout=0.05,
+                bias="none",
+                task_type="CAUSAL_LM"
+            )
+            
+            model = get_peft_model(model, lora_config)
+            model.print_trainable_parameters()
+            
+            # Load and prepare dataset
+            dataset = load_dataset("HuggingFaceH4/Multilingual-Thinking", split="train")
+            
+            def format_messages(example):
+                # Format the messages into a single text string
+                text = ""
+                for msg in example["messages"]:
+                    role = msg["role"]
+                    content = msg["content"]
+                    text += f"{role}: {content}\n\n"
+                return {"text": text.strip()}
+            
+            dataset = dataset.map(format_messages)
+            
+            def tokenize_function(examples):
+                return tokenizer(examples["text"], truncation=True, max_length=512)
+            
+            tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=dataset.column_names)
+            
+            # Training arguments
+            training_args = TrainingArguments(
+                output_dir="/workspace/output",
+                num_train_epochs=3,
+                per_device_train_batch_size=4,
+                gradient_accumulation_steps=4,
+                learning_rate=2e-4,
+                fp16=False,
+                bf16=True,
+                logging_steps=10,
+                save_strategy="epoch",
+                report_to="wandb",
+                warmup_steps=100,
+                optim="adamw_torch"
+            )
+            
+            # Data collator
+            data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+            
+            # Trainer
+            trainer = Trainer(
+                model=model,
+                args=training_args,
+                train_dataset=tokenized_dataset,
+                data_collator=data_collator,
+            )
+            
+            # Train
+            print("Starting fine-tuning...")
+            trainer.train()
+            
+            # Save model
+            model.save_pretrained("/workspace/output/final_model")
+            tokenizer.save_pretrained("/workspace/output/final_model")
+            
+            print("Fine-tuning complete!")
+            wandb.finish()
+            PYEOF
+            
+            cd /workspace
+            python finetune.py
+        env:
+        - name: HF_TOKEN
+          value: "${HF_TOKEN}"
+        - name: WANDB_API_KEY
+          value: "${WANDB_API_KEY}"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+          requests:
+            nvidia.com/gpu: 1
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 32Gi
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
