@@ -19,6 +19,53 @@ WANDB_API_KEY=your_api_key_here
 
 ## Examples
 
+### hello.yaml
+
+Minimal "Hello World" example for GB200.
+
+**Description:**
+- Simple pod that prints GPU information and runs a basic PyTorch test
+- Uses 1x GB200 GPU
+- Verifies CUDA availability and GPU access
+- Quick sanity check for cluster setup
+
+**Usage:**
+```bash
+kubectl apply -f hello.yaml
+kubectl logs -l app=hello-gb200 -f
+kubectl delete job hello-gb200
+```
+
+### finetune_gpt_oss.yaml
+
+Fine-tune GPT-OSS 20B model with LoRA on a single GPU.
+
+**Description:**
+- Fine-tunes OpenAI's GPT-OSS 20B model using LoRA (Low-Rank Adaptation)
+- Uses 1x GB200 GPU with MXFP4 quantization
+- Dataset: HuggingFaceH4/Multilingual-Thinking
+- LoRA config: r=16, alpha=32, targets q_proj and v_proj
+- Training: 3 epochs, batch size 4, gradient accumulation 4
+- Logs to Weights & Biases
+- Saves fine-tuned model to /workspace/output/final_model
+
+**Usage:**
+```bash
+# Set environment variables
+export HF_TOKEN=your_huggingface_token
+export WANDB_API_KEY=your_wandb_api_key
+
+# Launch job
+envsubst < finetune_gpt_oss.yaml | kubectl apply -f -
+
+# Monitor
+kubectl get job finetune-gpt-oss
+kubectl logs -l job-name=finetune-gpt-oss -f
+
+# Delete when done
+kubectl delete job finetune-gpt-oss
+```
+
 ### train-simple.yaml
 
 Single-GPU toy training sample for GB200.
